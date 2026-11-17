@@ -170,25 +170,101 @@ class DriveClient:
             "raw_url": f"/raw/{name}",
         }
 
+    def _is_parent_in_bucket(self, parents: list[str], bucket_id: str) -> bool:
+        if not bucket_id or not parents:
+            return False
+        if bucket_id in parents:
+            return True
+        for p_id in parents:
+            if hasattr(self, "_subfolders_cache") and p_id in self._subfolders_cache.values():
+                return True
+            try:
+                p_meta = self.service.files().get(fileId=p_id, fields="id, parents").execute()
+                if bucket_id in p_meta.get("parents", []):
+                    return True
+            except Exception:
+                pass
+        return False
+
+    def get_or_create_subfolder(self, subfolder_path: str) -> str:
+        """
+        Finds or creates nested subfolders under the bucket folder.
+        e.g. 'renders' or 'renders/2026'
+        """
+        current_parent = self.get_bucket_folder_id()
+        if not current_parent:
+            raise DriveError("Google Drive bucket folder not accessible.")
+
+        if not hasattr(self, "_subfolders_cache") or self._subfolders_cache is None:
+            self._subfolders_cache = {}
+
+        parts = [p.strip() for p in subfolder_path.strip("/").split("/") if p.strip()]
+        for part in parts:
+            safe_name = part.replace("\\", "\\\\").replace("'", "\\'")
+            cache_key = f"{current_parent}:{part}"
+            if cache_key in self._subfolders_cache:
+                current_parent = self._subfolders_cache[cache_key]
+                continue
+
+            query = (
+                f"mimeType = 'application/vnd.google-apps.folder' and "
+                f"name = '{safe_name}' and '{current_parent}' in parents and trashed = false"
+            )
+            try:
+                resp = self.service.files().list(q=query, spaces="drive", fields="files(id, name)").execute()
+                files = resp.get("files", [])
+                if files:
+                    folder_id = files[0]["id"]
+                else:
+                    body = {
+                        "name": part,
+                        "mimeType": "application/vnd.google-apps.folder",
+                        "parents": [current_parent],
+                    }
+                    folder = self.service.files().create(body=body, fields="id").execute()
+                    folder_id = folder.get("id")
+            except HttpError as e:
+                raise DriveError(f"Failed to find or create subfolder '{part}': {e}")
+
+            self._subfolders_cache[cache_key] = folder_id
+            current_parent = folder_id
+
+        return current_parent
+
     def upload_file(
         self,
         file_path: str,
         filename: str,
         mime_type: Optional[str] = None,
         overwrite: bool = False,
+        subfolder: Optional[str] = None,
     ) -> dict:
         """
-        Uploads a file to the bucket folder using resumable upload.
+        Uploads a file to the bucket folder (or subfolder) using resumable upload.
         If overwrite is True, deletes existing files with the same name first.
         """
         folder_id = self.get_bucket_folder_id()
         if not folder_id:
             raise DriveError("Google Drive bucket folder not accessible.")
 
-        safe_filename = filename.replace("\\", "\\\\").replace("'", "\\'")
+        effective_subfolder = subfolder
+        clean_filename = filename
+        if not effective_subfolder and "/" in filename:
+            parts = filename.split("/")
+            effective_subfolder = "/".join(parts[:-1])
+            clean_filename = parts[-1]
+        elif effective_subfolder and "/" in filename:
+            clean_filename = filename.split("/")[-1]
+
+        if effective_subfolder:
+            target_folder_id = self.get_or_create_subfolder(effective_subfolder)
+        else:
+            target_folder_id = folder_id
+
+        safe_filename = clean_filename.replace("\\", "\\\\").replace("'", "\\'")
 
         if overwrite:
-            query = f"'{folder_id}' in parents and name = '{safe_filename}' and trashed = false"
+            query = f"'{target_folder_id}' in parents and name = '{safe_filename}' and trashed = false"
             try:
                 existing = (
                     self.service.files()
@@ -207,8 +283,8 @@ class DriveClient:
             resumable=True,
         )
         metadata = {
-            "name": filename,
-            "parents": [folder_id],
+            "name": clean_filename,
+            "parents": [target_folder_id],
         }
 
         request = self.service.files().create(
@@ -235,15 +311,25 @@ class DriveClient:
             except OSError:
                 response["size"] = 0
 
-        return self._format_file_info(response)
+        info = self._format_file_info(response)
+        if effective_subfolder:
+            info["subfolder"] = effective_subfolder
+            info["raw_path"] = f"/raw/{effective_subfolder}/{clean_filename}"
+            info["raw_url"] = f"/raw/{effective_subfolder}/{clean_filename}"
+        return info
 
-    def list_files(self) -> list[dict]:
-        """Lists all non-trashed files inside the bucket folder."""
+    def list_files(self, subfolder: Optional[str] = None) -> list[dict]:
+        """Lists all non-trashed files inside the bucket folder or subfolder."""
         folder_id = self.get_bucket_folder_id()
         if not folder_id:
             raise DriveError("Google Drive bucket folder not accessible.")
 
-        query = f"'{folder_id}' in parents and trashed = false"
+        if subfolder:
+            target_folder_id = self.get_or_create_subfolder(subfolder)
+        else:
+            target_folder_id = folder_id
+
+        query = f"'{target_folder_id}' in parents and trashed = false"
         files = []
         page_token = None
 
@@ -260,7 +346,12 @@ class DriveClient:
                 .execute()
             )
             for item in resp.get("files", []):
-                files.append(self._format_file_info(item))
+                info = self._format_file_info(item)
+                if subfolder:
+                    info["subfolder"] = subfolder
+                    info["raw_path"] = f"/raw/{subfolder}/{info['name']}"
+                    info["raw_url"] = f"/raw/{subfolder}/{info['name']}"
+                files.append(info)
             page_token = resp.get("nextPageToken")
             if not page_token:
                 break
@@ -286,16 +377,24 @@ class DriveClient:
 
         if file_info.get("trashed"):
             raise FileNotFoundError(f"File {file_id} is in trash.")
-        if folder_id and folder_id not in file_info.get("parents", []):
+        if folder_id and not self._is_parent_in_bucket(file_info.get("parents", []), folder_id):
             raise FileNotFoundError(f"File {file_id} not in bucket folder.")
 
         return self._format_file_info(file_info)
 
     def get_latest_file_by_name(self, filename: str) -> dict:
         """Retrieves the latest non-trashed file matching filename in the bucket folder."""
-        folder_id = self.get_bucket_folder_id()
-        safe_filename = filename.replace("\\", "\\\\").replace("'", "\\'")
-        query = f"'{folder_id}' in parents and name = '{safe_filename}' and trashed = false"
+        clean_filename = filename
+        target_folder_id = self.get_bucket_folder_id()
+        effective_subfolder = None
+        if "/" in filename:
+            parts = filename.split("/")
+            effective_subfolder = "/".join(parts[:-1])
+            clean_filename = parts[-1]
+            target_folder_id = self.get_or_create_subfolder(effective_subfolder)
+
+        safe_filename = clean_filename.replace("\\", "\\\\").replace("'", "\\'")
+        query = f"'{target_folder_id}' in parents and name = '{safe_filename}' and trashed = false"
 
         try:
             resp = (
@@ -316,7 +415,12 @@ class DriveClient:
         if not files:
             raise FileNotFoundError(f"File '{filename}' not found.")
 
-        return self._format_file_info(files[0])
+        info = self._format_file_info(files[0])
+        if effective_subfolder:
+            info["subfolder"] = effective_subfolder
+            info["raw_path"] = f"/raw/{effective_subfolder}/{clean_filename}"
+            info["raw_url"] = f"/raw/{effective_subfolder}/{clean_filename}"
+        return info
 
     def stream_file(self, file_id: str, chunk_size: int = 1024 * 1024) -> Generator[bytes, None, None]:
         """Streams file content chunks from Google Drive."""
@@ -363,7 +467,7 @@ class DriveClient:
 
         if file_info.get("trashed"):
             raise FileNotFoundError(f"File {file_id} not found or already trashed.")
-        if folder_id and folder_id not in file_info.get("parents", []):
+        if folder_id and not self._is_parent_in_bucket(file_info.get("parents", []), folder_id):
             raise FileNotFoundError(f"File {file_id} not in bucket folder.")
 
         try:

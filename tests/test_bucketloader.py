@@ -463,6 +463,34 @@ def test_upload_file_with_overwrite(client, mock_drive_client):
     assert resp.status_code == 200
     assert resp.json()["id"] == "file_replaced"
 
+
+def test_upload_file_subfolder(client, mock_drive_client):
+    expected_meta = {
+        "id": "file_sub",
+        "name": "anim.mp4",
+        "subfolder": "renders",
+        "path": "/files/file_sub",
+        "url": "/files/file_sub",
+        "raw_path": "/raw/renders/anim.mp4",
+        "raw_url": "/raw/renders/anim.mp4",
+    }
+    mock_drive_client.upload_file = MagicMock(return_value=expected_meta)
+
+    files = {"file": ("anim.mp4", b"fake-mp4-data", "video/mp4")}
+    data_form = {"subfolder": "renders"}
+    resp = client.post(
+        "/upload",
+        files=files,
+        data=data_form,
+        headers={"X-API-Key": TEST_API_KEY},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["subfolder"] == "renders"
+    assert resp.json()["raw_path"] == "/raw/renders/anim.mp4"
+    mock_drive_client.upload_file.assert_called_once()
+    _, kwargs = mock_drive_client.upload_file.call_args
+    assert kwargs["subfolder"] == "renders"
+
     mock_drive_client.upload_file.assert_called_once()
     call_kwargs = mock_drive_client.upload_file.call_args[1]
     assert call_kwargs["filename"] == "replaced.png"

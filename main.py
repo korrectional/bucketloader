@@ -448,6 +448,7 @@ def auth_callback(
 async def upload_file(
     file: UploadFile = File(...),
     overwrite: bool = Form(False),
+    subfolder: Optional[str] = Form(None),
     _: str = Depends(verify_api_key),
     client: DriveClient = Depends(get_drive_client),
 ):
@@ -471,6 +472,7 @@ async def upload_file(
             filename=filename,
             mime_type=file.content_type,
             overwrite=overwrite,
+            subfolder=subfolder,
         )
         return file_meta
     except DriveError as e:
@@ -487,13 +489,14 @@ async def upload_file(
 
 @app.get("/files")
 def list_files(
+    subfolder: Optional[str] = Query(None),
     _: str = Depends(verify_api_key),
     client: DriveClient = Depends(get_drive_client),
 ):
     """Lists all stored files in the bucket folder."""
     ensure_drive_authenticated(client)
     try:
-        files = client.list_files()
+        files = client.list_files(subfolder=subfolder)
         return files
     except DriveError as e:
         raise HTTPException(
