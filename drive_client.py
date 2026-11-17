@@ -40,18 +40,23 @@ class DriveClient:
         )
         self.folder_name = folder_name or os.getenv("BUCKET_FOLDER_NAME", "bucket")
         self._service = service
+        self._service_explicitly_set = service is not None
         self._bucket_folder_id: Optional[str] = None
+        self._subfolders_cache: dict[str, str] = {}
 
     def set_service(self, service, bucket_folder_id: Optional[str] = None):
         """Used for testing or manual injection of Google Drive service."""
         self._service = service
+        self._service_explicitly_set = True
         if bucket_folder_id is not None:
             self._bucket_folder_id = bucket_folder_id
 
     def reload(self) -> Optional[str]:
         """Reloads the active DriveClient in memory without requiring a server restart."""
         self._service = None
+        self._service_explicitly_set = False
         self._bucket_folder_id = None
+        self._subfolders_cache = {}
         if self.service is not None:
             try:
                 return self.get_bucket_folder_id()
@@ -61,7 +66,7 @@ class DriveClient:
 
     @property
     def service(self):
-        if self._service is None:
+        if self._service is None and not self._service_explicitly_set:
             self._service = self._init_service()
         return self._service
 
