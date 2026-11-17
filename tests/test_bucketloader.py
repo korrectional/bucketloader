@@ -488,13 +488,9 @@ def test_upload_file_subfolder(client, mock_drive_client):
     assert resp.json()["subfolder"] == "renders"
     assert resp.json()["raw_path"] == "/raw/renders/anim.mp4"
     mock_drive_client.upload_file.assert_called_once()
-    _, kwargs = mock_drive_client.upload_file.call_args
-    assert kwargs["subfolder"] == "renders"
-
-    mock_drive_client.upload_file.assert_called_once()
     call_kwargs = mock_drive_client.upload_file.call_args[1]
-    assert call_kwargs["filename"] == "replaced.png"
-    assert call_kwargs["overwrite"] is True
+    assert call_kwargs["filename"] == "anim.mp4"
+    assert call_kwargs["subfolder"] == "renders"
 
 
 # ============================================================================
