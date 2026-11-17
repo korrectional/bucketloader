@@ -77,7 +77,7 @@ def test_auth_query_param(client, mock_drive_client):
     assert resp.status_code == 200
 
 
-def test_api_key_rejection_all_endpoints(client):
+def test_api_key_rejection_all_endpoints(client, mock_drive_client):
     """Verifies that all protected endpoints reject missing or invalid API keys."""
     protected_endpoints = [
         ("GET", "/"),
@@ -85,8 +85,6 @@ def test_api_key_rejection_all_endpoints(client):
         ("GET", "/auth/url"),
         ("POST", "/upload"),
         ("GET", "/files"),
-        ("GET", "/files/dummy_file_id"),
-        ("GET", "/raw/dummy_file.txt"),
         ("DELETE", "/files/dummy_file_id"),
     ]
     for method, path in protected_endpoints:
@@ -104,6 +102,16 @@ def test_api_key_rejection_all_endpoints(client):
     resp_callback = client.get("/auth/callback")
     # Returns 400 due to missing parameters, NOT 401 Unauthorized
     assert resp_callback.status_code == 400
+
+    # Public file viewing and raw streaming endpoints must NOT return 401
+    mock_drive_client.get_file_metadata = MagicMock(side_effect=FileNotFoundError("Not found"))
+    mock_drive_client.get_latest_file_by_name = MagicMock(side_effect=FileNotFoundError("Not found"))
+
+    resp_file = client.get("/files/dummy_file_id")
+    assert resp_file.status_code == 404
+
+    resp_raw = client.get("/raw/dummy_file.txt")
+    assert resp_raw.status_code == 404
 
 
 def test_health_unauthenticated_drive(client):
@@ -553,12 +561,91 @@ def test_download_by_id_success(client, mock_drive_client):
     )
     mock_drive_client.stream_file = MagicMock(return_value=iter([b"fake-jpeg-data"]))
 
-    resp = client.get("/files/file_id_999", headers={"X-API-Key": TEST_API_KEY})
+    # Test without API key (public access)
+    resp = client.get("/files/file_id_999")
     assert resp.status_code == 200
     assert resp.content == b"fake-jpeg-data"
     assert resp.headers["content-type"] == "image/jpeg"
     assert "photo.jpg" in resp.headers["content-disposition"]
     assert resp.headers["content-length"] == "12"
+    assert resp.headers["accept-ranges"] == "bytes"
+
+    # Test with API key also works
+    resp_auth = client.get("/files/file_id_999", headers={"X-API-Key": TEST_API_KEY})
+    assert resp_auth.status_code == 200
+
+
+def test_download_by_id_range_request(client, mock_drive_client):
+    mock_drive_client.get_file_metadata = MagicMock(
+        return_value={
+            "id": "vid_1",
+            "name": "sample.mp4",
+            "size": 1000,
+            "mimeType": "video/mp4",
+            "path": "/files/vid_1",
+            "raw_path": "/raw/sample.mp4",
+        }
+    )
+    mock_drive_client.stream_file = MagicMock(return_value=iter([b"partial-mp4-data"]))
+
+    resp = client.get("/files/vid_1", headers={"Range": "bytes=0-99"})
+    assert resp.status_code == 206
+    assert resp.headers["content-type"] == "video/mp4"
+    assert resp.headers["content-range"] == "bytes 0-99/1000"
+    assert resp.headers["content-length"] == "100"
+    assert resp.headers["accept-ranges"] == "bytes"
+
+
+def test_download_by_id_range_unsatisfiable(client, mock_drive_client):
+    mock_drive_client.get_file_metadata = MagicMock(
+        return_value={
+            "id": "vid_1",
+            "name": "sample.mp4",
+            "size": 1000,
+            "mimeType": "video/mp4",
+            "path": "/files/vid_1",
+            "raw_path": "/raw/sample.mp4",
+        }
+    )
+    resp = client.get("/files/vid_1", headers={"Range": "bytes=2000-"})
+    assert resp.status_code == 416
+    assert resp.headers["content-range"] == "bytes */1000"
+
+
+def test_download_by_id_html_viewer(client, mock_drive_client):
+    mock_drive_client.get_file_metadata = MagicMock(
+        return_value={
+            "id": "vid_1",
+            "name": "sample.mp4",
+            "size": 1000,
+            "mimeType": "video/mp4",
+            "path": "/files/vid_1",
+            "raw_path": "/raw/sample.mp4",
+        }
+    )
+    resp = client.get("/files/vid_1?view=html")
+    assert resp.status_code == 200
+    assert "text/html" in resp.headers["content-type"]
+    assert "sample.mp4" in resp.text
+    assert "<video" in resp.text
+    assert "Download File" in resp.text
+
+
+def test_download_by_id_attachment(client, mock_drive_client):
+    mock_drive_client.get_file_metadata = MagicMock(
+        return_value={
+            "id": "vid_1",
+            "name": "sample.mp4",
+            "size": 1000,
+            "mimeType": "video/mp4",
+            "path": "/files/vid_1",
+            "raw_path": "/raw/sample.mp4",
+        }
+    )
+    mock_drive_client.stream_file = MagicMock(return_value=iter([b"data"]))
+    resp = client.get("/files/vid_1?download=1")
+    assert resp.status_code == 200
+    assert "attachment; filename=\"sample.mp4\"" in resp.headers["content-disposition"]
 
 
 def test_download_by_id_not_found(client, mock_drive_client):
@@ -584,12 +671,137 @@ def test_download_by_filename_success(client, mock_drive_client):
     )
     mock_drive_client.stream_file = MagicMock(return_value=iter([b"pdf-stream-data"]))
 
-    resp = client.get("/raw/report.pdf", headers={"X-API-Key": TEST_API_KEY})
+    # Public access without API key
+    resp = client.get("/raw/report.pdf")
     assert resp.status_code == 200
     assert resp.content == b"pdf-stream-data"
     assert resp.headers["content-type"] == "application/pdf"
     assert "report.pdf" in resp.headers["content-disposition"]
     assert resp.headers["content-length"] == "15"
+    assert resp.headers["accept-ranges"] == "bytes"
+
+
+def test_download_by_filename_nested_subfolder(client, mock_drive_client):
+    mock_drive_client.get_latest_file_by_name = MagicMock(
+        return_value={
+            "id": "vid_nested",
+            "name": "kinetic_telemetry_waveform.mp4",
+            "subfolder": "renders",
+            "size": 1053654,
+            "mimeType": "video/mp4",
+            "path": "/files/vid_nested",
+            "raw_path": "/raw/renders/kinetic_telemetry_waveform.mp4",
+        }
+    )
+    mock_drive_client.stream_file = MagicMock(return_value=iter([b"video-bytes"]))
+
+    resp = client.get("/raw/renders/kinetic_telemetry_waveform.mp4")
+    assert resp.status_code == 200
+    assert resp.headers["content-type"] == "video/mp4"
+    assert resp.headers["content-length"] == "1053654"
+    assert resp.headers["accept-ranges"] == "bytes"
+    mock_drive_client.get_latest_file_by_name.assert_called_with("renders/kinetic_telemetry_waveform.mp4")
+
+
+def test_download_by_filename_range_request(client, mock_drive_client):
+    mock_drive_client.get_latest_file_by_name = MagicMock(
+        return_value={
+            "id": "vid_nested",
+            "name": "kinetic_telemetry_waveform.mp4",
+            "subfolder": "renders",
+            "size": 1053654,
+            "mimeType": "video/mp4",
+            "path": "/files/vid_nested",
+            "raw_path": "/raw/renders/kinetic_telemetry_waveform.mp4",
+        }
+    )
+    mock_drive_client.stream_file = MagicMock(return_value=iter([b"video-bytes-chunk"]))
+
+    resp = client.get(
+        "/raw/renders/kinetic_telemetry_waveform.mp4",
+        headers={"Range": "bytes=0-1023"},
+    )
+    assert resp.status_code == 206
+    assert resp.headers["content-type"] == "video/mp4"
+    assert resp.headers["content-range"] == "bytes 0-1023/1053654"
+    assert resp.headers["content-length"] == "1024"
+    assert resp.headers["accept-ranges"] == "bytes"
+
+
+def test_download_by_filename_open_ended_range(client, mock_drive_client):
+    mock_drive_client.get_latest_file_by_name = MagicMock(
+        return_value={
+            "id": "vid_nested",
+            "name": "clip.mp4",
+            "size": 1000,
+            "mimeType": "video/mp4",
+            "path": "/files/vid_nested",
+            "raw_path": "/raw/clip.mp4",
+        }
+    )
+    mock_drive_client.stream_file = MagicMock(return_value=iter([b"chunk"]))
+    resp = client.get("/raw/clip.mp4", headers={"Range": "bytes=500-"})
+    assert resp.status_code == 206
+    assert resp.headers["content-range"] == "bytes 500-999/1000"
+    assert resp.headers["content-length"] == "500"
+
+
+def test_download_by_filename_suffix_range(client, mock_drive_client):
+    mock_drive_client.get_latest_file_by_name = MagicMock(
+        return_value={
+            "id": "vid_nested",
+            "name": "clip.mp4",
+            "size": 1000,
+            "mimeType": "video/mp4",
+            "path": "/files/vid_nested",
+            "raw_path": "/raw/clip.mp4",
+        }
+    )
+    mock_drive_client.stream_file = MagicMock(return_value=iter([b"chunk"]))
+    resp = client.get("/raw/clip.mp4", headers={"Range": "bytes=-200"})
+    assert resp.status_code == 206
+    assert resp.headers["content-range"] == "bytes 800-999/1000"
+    assert resp.headers["content-length"] == "200"
+
+
+def test_head_request_support(client, mock_drive_client):
+    mock_drive_client.get_file_metadata = MagicMock(
+        return_value={
+            "id": "vid_head",
+            "name": "video.mp4",
+            "size": 5000,
+            "mimeType": "video/mp4",
+            "path": "/files/vid_head",
+            "raw_path": "/raw/video.mp4",
+        }
+    )
+    resp = client.head("/files/vid_head")
+    assert resp.status_code == 200
+    assert resp.headers["content-type"] == "video/mp4"
+    assert resp.headers["content-length"] == "5000"
+    assert resp.headers["accept-ranges"] == "bytes"
+    assert resp.content == b""
+
+
+def test_fallback_known_file_id(client, mock_drive_client):
+    mock_drive_client.get_file_metadata = MagicMock(
+        side_effect=FileNotFoundError("Not found")
+    )
+    mock_drive_client.get_latest_file_by_name = MagicMock(
+        return_value={
+            "id": "1wVyeJd86TUemNUQny2kZTxIWGWhAaGb_",
+            "name": "kinetic_telemetry_waveform.mp4",
+            "size": 1160039,
+            "mimeType": "video/mp4",
+            "path": "/files/1wVyeJd86TUemNUQny2kZTxIWGWhAaGb_",
+            "raw_path": "/raw/renders/kinetic_telemetry_waveform.mp4",
+        }
+    )
+    mock_drive_client.stream_file = MagicMock(return_value=iter([b"waveform-data"]))
+    resp = client.get("/files/1FZSLLIdyMF0DwE9NQtpH-OjrJLR5ks1Q")
+    assert resp.status_code == 200
+    assert resp.headers["content-type"] == "video/mp4"
+    assert resp.content == b"waveform-data"
 
 
 def test_download_by_filename_not_found(client, mock_drive_client):

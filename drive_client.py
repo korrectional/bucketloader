@@ -186,9 +186,9 @@ class DriveClient:
                 pass
         return False
 
-    def get_or_create_subfolder(self, subfolder_path: str) -> str:
+    def get_or_create_subfolder(self, subfolder_path: str, create: bool = True) -> Optional[str]:
         """
-        Finds or creates nested subfolders under the bucket folder.
+        Finds or optionally creates nested subfolders under the bucket folder.
         e.g. 'renders' or 'renders/2026'
         """
         current_parent = self.get_bucket_folder_id()
@@ -215,7 +215,7 @@ class DriveClient:
                 files = resp.get("files", [])
                 if files:
                     folder_id = files[0]["id"]
-                else:
+                elif create:
                     body = {
                         "name": part,
                         "mimeType": "application/vnd.google-apps.folder",
@@ -223,6 +223,8 @@ class DriveClient:
                     }
                     folder = self.service.files().create(body=body, fields="id").execute()
                     folder_id = folder.get("id")
+                else:
+                    return None
             except HttpError as e:
                 raise DriveError(f"Failed to find or create subfolder '{part}': {e}")
 
@@ -384,14 +386,19 @@ class DriveClient:
 
     def get_latest_file_by_name(self, filename: str) -> dict:
         """Retrieves the latest non-trashed file matching filename in the bucket folder."""
-        clean_filename = filename
+        clean_filename = filename.strip("/")
         target_folder_id = self.get_bucket_folder_id()
         effective_subfolder = None
-        if "/" in filename:
-            parts = filename.split("/")
-            effective_subfolder = "/".join(parts[:-1])
-            clean_filename = parts[-1]
-            target_folder_id = self.get_or_create_subfolder(effective_subfolder)
+        if "/" in clean_filename:
+            parts = [p for p in clean_filename.split("/") if p]
+            if len(parts) > 1:
+                effective_subfolder = "/".join(parts[:-1])
+                clean_filename = parts[-1]
+                target_folder_id = self.get_or_create_subfolder(effective_subfolder, create=False)
+                if not target_folder_id:
+                    raise FileNotFoundError(f"Subfolder '{effective_subfolder}' not found.")
+            elif len(parts) == 1:
+                clean_filename = parts[0]
 
         safe_filename = clean_filename.replace("\\", "\\\\").replace("'", "\\'")
         query = f"'{target_folder_id}' in parents and name = '{safe_filename}' and trashed = false"
@@ -422,8 +429,35 @@ class DriveClient:
             info["raw_url"] = f"/raw/{effective_subfolder}/{clean_filename}"
         return info
 
-    def stream_file(self, file_id: str, chunk_size: int = 1024 * 1024) -> Generator[bytes, None, None]:
-        """Streams file content chunks from Google Drive."""
+    def stream_file(
+        self,
+        file_id: str,
+        chunk_size: int = 1024 * 1024,
+        range_start: Optional[int] = None,
+        range_end: Optional[int] = None,
+    ) -> Generator[bytes, None, None]:
+        """Streams file content chunks from Google Drive, optionally within a byte range."""
+        if range_start is not None and range_end is not None:
+            curr = range_start
+            while curr <= range_end:
+                step_end = min(curr + chunk_size - 1, range_end)
+                request = self.service.files().get_media(fileId=file_id)
+                if hasattr(request, "headers"):
+                    request.headers["Range"] = f"bytes={curr}-{step_end}"
+                try:
+                    chunk = request.execute()
+                    if isinstance(chunk, (bytes, bytearray)):
+                        yield bytes(chunk)
+                    elif hasattr(chunk, "read"):
+                        while c := chunk.read(chunk_size):
+                            yield c
+                    else:
+                        yield str(chunk).encode("utf-8")
+                except HttpError as e:
+                    raise DriveError(f"Failed to stream byte range {curr}-{step_end}: {e}")
+                curr = step_end + 1
+            return
+
         request = self.service.files().get_media(fileId=file_id)
 
         # Attempt MediaIoBaseDownload

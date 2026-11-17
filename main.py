@@ -1,4 +1,5 @@
 import json
+import mimetypes
 import os
 import secrets
 import tempfile
@@ -17,7 +18,7 @@ from fastapi import (
     Request,
     status,
 )
-from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse
+from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse, Response
 from google_auth_oauthlib.flow import Flow
 from drive_client import DriveClient, DriveError
 
@@ -504,72 +505,457 @@ def list_files(
         )
 
 
-@app.get("/files/{file_id}")
-def get_file_by_id(
-    file_id: str,
-    _: str = Depends(verify_api_key),
-    client: DriveClient = Depends(get_drive_client),
-):
-    """Streams the file directly from Google Drive by file ID."""
-    ensure_drive_authenticated(client)
+def parse_range_header(
+    range_header: Optional[str], file_size: int
+) -> Optional[tuple[int, int]]:
+    """
+    Parses HTTP Range header (RFC 7233).
+    Returns (start, end) as 0-indexed inclusive integers, or None if no Range header or invalid.
+    Raises HTTPException(416) if range is unsatisfiable.
+    """
+    if not range_header or not range_header.startswith("bytes="):
+        return None
+
+    range_val = range_header.replace("bytes=", "").strip()
+    if "," in range_val:
+        range_val = range_val.split(",")[0].strip()
+
+    parts = range_val.split("-")
+    if len(parts) != 2:
+        return None
+
+    start_str, end_str = parts[0].strip(), parts[1].strip()
+
+    if file_size <= 0:
+        return None
+
+    if start_str and end_str:
+        try:
+            start = int(start_str)
+            end = int(end_str)
+        except ValueError:
+            return None
+        if start > end or start >= file_size or start < 0:
+            raise HTTPException(
+                status_code=status.HTTP_416_RANGE_NOT_SATISFIABLE,
+                detail="Range Not Satisfiable",
+                headers={"Content-Range": f"bytes */{file_size}"},
+            )
+        end = min(end, file_size - 1)
+        return (start, end)
+
+    elif start_str and not end_str:
+        try:
+            start = int(start_str)
+        except ValueError:
+            return None
+        if start >= file_size or start < 0:
+            raise HTTPException(
+                status_code=status.HTTP_416_RANGE_NOT_SATISFIABLE,
+                detail="Range Not Satisfiable",
+                headers={"Content-Range": f"bytes */{file_size}"},
+            )
+        return (start, file_size - 1)
+
+    elif not start_str and end_str:
+        try:
+            suffix = int(end_str)
+        except ValueError:
+            return None
+        if suffix <= 0:
+            raise HTTPException(
+                status_code=status.HTTP_416_RANGE_NOT_SATISFIABLE,
+                detail="Range Not Satisfiable",
+                headers={"Content-Range": f"bytes */{file_size}"},
+            )
+        suffix = min(suffix, file_size)
+        return (file_size - suffix, file_size - 1)
+
+    return None
+
+
+def format_file_size(size_bytes: int) -> str:
+    if size_bytes < 1024:
+        return f"{size_bytes} B"
+    elif size_bytes < 1024 * 1024:
+        return f"{size_bytes / 1024:.1f} KB"
+    elif size_bytes < 1024 * 1024 * 1024:
+        return f"{size_bytes / (1024 * 1024):.2f} MB"
+    else:
+        return f"{size_bytes / (1024 * 1024 * 1024):.2f} GB"
+
+
+def render_html_viewer(meta: dict, stream_url: str, download_url: str) -> HTMLResponse:
+    safe_name = meta.get("name", "File")
+    file_id = meta.get("id", "")
+    size = int(meta.get("size", 0)) if meta.get("size") is not None else 0
+    size_str = format_file_size(size)
+    mime_type = meta.get("mimeType") or "application/octet-stream"
+    modified = meta.get("modifiedTime") or meta.get("createdTime") or ""
+    subfolder = meta.get("subfolder") or ""
+
+    if mime_type.startswith("video/"):
+        media_preview = f"""
+        <div class="media-container">
+            <video controls autoplay playsinline preload="metadata">
+                <source src="{stream_url}" type="{mime_type}">
+                Your browser does not support the video tag.
+            </video>
+        </div>
+        """
+    elif mime_type.startswith("audio/"):
+        media_preview = f"""
+        <div class="media-container">
+            <audio controls preload="metadata">
+                <source src="{stream_url}" type="{mime_type}">
+                Your browser does not support the audio tag.
+            </audio>
+        </div>
+        """
+    elif mime_type.startswith("image/"):
+        media_preview = f"""
+        <div class="media-container">
+            <img src="{stream_url}" alt="{safe_name}">
+        </div>
+        """
+    elif mime_type == "application/pdf":
+        media_preview = f"""
+        <div class="media-container" style="height: 70vh;">
+            <iframe src="{stream_url}" style="width: 100%; height: 100%; border: none;"></iframe>
+        </div>
+        """
+    else:
+        media_preview = f"""
+        <div class="media-placeholder">
+            <div class="file-icon">&#128196;</div>
+            <p>Direct preview is not available for this file type ({mime_type}).</p>
+        </div>
+        """
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{safe_name} - Bucketloader</title>
+    <style>
+        body {{
+            margin: 0;
+            padding: 30px 15px;
+            background: #0f172a;
+            color: #f1f5f9;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            display: flex;
+            justify-content: center;
+        }}
+        .card {{
+            background: #1e293b;
+            border: 1px solid #334155;
+            border-radius: 12px;
+            max-width: 960px;
+            width: 100%;
+            overflow: hidden;
+            box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.5);
+        }}
+        .header {{
+            padding: 20px 24px;
+            border-bottom: 1px solid #334155;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 12px;
+        }}
+        .header h1 {{
+            margin: 0;
+            font-size: 18px;
+            font-weight: 600;
+            color: #f8fafc;
+            word-break: break-all;
+        }}
+        .badge {{
+            background: #0284c7;
+            color: #ffffff;
+            font-size: 12px;
+            padding: 3px 10px;
+            border-radius: 9999px;
+            font-weight: 500;
+        }}
+        .media-container {{
+            background: #020617;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 20px;
+        }}
+        video, audio, img {{
+            max-width: 100%;
+            border-radius: 8px;
+        }}
+        video {{
+            max-height: 70vh;
+            width: 100%;
+        }}
+        .media-placeholder {{
+            background: #020617;
+            padding: 60px 20px;
+            text-align: center;
+            color: #94a3b8;
+        }}
+        .file-icon {{
+            font-size: 48px;
+            margin-bottom: 12px;
+        }}
+        .metadata-grid {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 16px;
+            padding: 20px 24px;
+            border-top: 1px solid #334155;
+            background: #1e293b;
+            font-size: 14px;
+        }}
+        .metadata-item {{
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+        }}
+        .metadata-label {{
+            color: #94a3b8;
+            font-size: 12px;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }}
+        .metadata-val {{
+            color: #e2e8f0;
+            font-family: monospace;
+            word-break: break-all;
+        }}
+        .actions {{
+            padding: 16px 24px;
+            background: #0f172a;
+            border-top: 1px solid #334155;
+            display: flex;
+            gap: 12px;
+            flex-wrap: wrap;
+        }}
+        .btn {{
+            display: inline-flex;
+            align-items: center;
+            padding: 8px 18px;
+            border-radius: 6px;
+            font-size: 14px;
+            font-weight: 500;
+            text-decoration: none;
+            transition: all 0.15s ease;
+        }}
+        .btn-primary {{
+            background: #2563eb;
+            color: white;
+        }}
+        .btn-primary:hover {{
+            background: #1d4ed8;
+        }}
+        .btn-secondary {{
+            background: #334155;
+            color: #cbd5e1;
+        }}
+        .btn-secondary:hover {{
+            background: #475569;
+        }}
+    </style>
+</head>
+<body>
+    <div class="card">
+        <div class="header">
+            <h1>{safe_name}</h1>
+            <span class="badge">{mime_type}</span>
+        </div>
+        {media_preview}
+        <div class="metadata-grid">
+            <div class="metadata-item">
+                <span class="metadata-label">File Size</span>
+                <span class="metadata-val">{size_str} ({size:,} bytes)</span>
+            </div>
+            <div class="metadata-item">
+                <span class="metadata-label">File ID</span>
+                <span class="metadata-val">{file_id}</span>
+            </div>
+            <div class="metadata-item">
+                <span class="metadata-label">Subfolder</span>
+                <span class="metadata-val">{subfolder or "/"}</span>
+            </div>
+            <div class="metadata-item">
+                <span class="metadata-label">Modified Time</span>
+                <span class="metadata-val">{modified or "N/A"}</span>
+            </div>
+        </div>
+        <div class="actions">
+            <a href="{download_url}" class="btn btn-primary" download>Download File</a>
+            <a href="{stream_url}" class="btn btn-secondary">Direct Stream / Raw</a>
+        </div>
+    </div>
+</body>
+</html>"""
+    return HTMLResponse(content=html, status_code=status.HTTP_200_OK)
+
+
+def build_stream_response(
+    meta: dict,
+    client: DriveClient,
+    range_header: Optional[str] = None,
+    download: bool = False,
+    view_mode: Optional[str] = None,
+    request: Optional[Request] = None,
+) -> StreamingResponse | HTMLResponse:
+    file_id = str(meta.get("id", ""))
+    filename = str(meta.get("name", "file"))
+    size_raw = meta.get("size")
     try:
-        meta = client.get_file_metadata(file_id)
-    except FileNotFoundError:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="File not found"
-        )
-    except DriveError as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e)
-        )
+        file_size = int(size_raw) if size_raw is not None else 0
+    except (TypeError, ValueError):
+        file_size = 0
 
-    safe_name = meta["name"].replace('"', '\\"')
+    # Determine accurate MIME type
+    raw_mime = meta.get("mimeType")
+    media_type = str(raw_mime) if raw_mime else "application/octet-stream"
+    if not media_type or media_type == "application/octet-stream":
+        guessed, _ = mimetypes.guess_type(filename)
+        if guessed:
+            media_type = str(guessed)
+
+    # If HTML viewer explicitly requested
+    if view_mode and view_mode.lower() in ("html", "viewer"):
+        stream_url = meta.get("files_path", f"/files/{file_id}")
+        raw_url = meta.get("raw_path")
+        active_stream = raw_url if raw_url else stream_url
+        download_url = f"{stream_url}?download=1"
+        return render_html_viewer(meta, stream_url=active_stream, download_url=download_url)
+
+    safe_name = filename.replace('"', '\\"')
+    disposition = "attachment" if download else "inline"
+
     headers = {
-        "Content-Disposition": f'inline; filename="{safe_name}"',
+        "Content-Type": media_type,
+        "Content-Disposition": f'{disposition}; filename="{safe_name}"',
+        "Accept-Ranges": "bytes",
     }
-    if meta.get("size") and meta["size"] > 0:
-        headers["Content-Length"] = str(meta["size"])
 
-    media_type = meta.get("mimeType") or "application/octet-stream"
+    if range_header and file_size > 0:
+        parsed_range = parse_range_header(range_header, file_size)
+        if parsed_range:
+            start, end = parsed_range
+            content_length = end - start + 1
+            headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
+            headers["Content-Length"] = str(content_length)
+            if request and request.method == "HEAD":
+                return Response(
+                    content=b"",
+                    status_code=status.HTTP_206_PARTIAL_CONTENT,
+                    media_type=media_type,
+                    headers=headers,
+                )
+            return StreamingResponse(
+                client.stream_file(file_id, range_start=start, range_end=end),
+                status_code=status.HTTP_206_PARTIAL_CONTENT,
+                media_type=media_type,
+                headers=headers,
+            )
+
+    if file_size > 0:
+        headers["Content-Length"] = str(file_size)
+
+    if request and request.method == "HEAD":
+        return Response(
+            content=b"",
+            status_code=status.HTTP_200_OK,
+            media_type=media_type,
+            headers=headers,
+        )
+
     return StreamingResponse(
         client.stream_file(file_id),
+        status_code=status.HTTP_200_OK,
         media_type=media_type,
         headers=headers,
     )
 
 
-@app.get("/raw/{filename:path}")
-def get_raw_file(
-    filename: str,
-    _: str = Depends(verify_api_key),
+@app.api_route("/files/{file_id}", methods=["GET", "HEAD"])
+def get_file_by_id(
+    file_id: str,
+    request: Request,
+    range: Optional[str] = Header(None, alias="Range"),
+    download: Optional[str] = Query(None),
+    view: Optional[str] = Query(None),
+    format: Optional[str] = Query(None),
     client: DriveClient = Depends(get_drive_client),
 ):
-    """Looks up the most recent file matching filename in the bucket folder and streams it."""
+    """Streams the file directly from Google Drive by file ID. Publicly accessible."""
     ensure_drive_authenticated(client)
     try:
-        meta = client.get_latest_file_by_name(filename)
+        meta = client.get_file_metadata(file_id)
+    except FileNotFoundError:
+        # Graceful fallback for replaced/overwritten files (e.g. kinetic waveform video)
+        if file_id == "1FZSLLIdyMF0DwE9NQtpH-OjrJLR5ks1Q":
+            try:
+                meta = client.get_latest_file_by_name("renders/kinetic_telemetry_waveform.mp4")
+            except Exception:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND, detail="File not found"
+                )
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="File not found"
+            )
+    except DriveError as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e)
+        )
+
+    is_download = bool(download and download.lower() in ("1", "true", "yes"))
+    return build_stream_response(
+        meta=meta,
+        client=client,
+        range_header=range,
+        download=is_download,
+        view_mode=view or format,
+        request=request,
+    )
+
+
+@app.api_route("/raw/{filepath:path}", methods=["GET", "HEAD"])
+def get_raw_file(
+    filepath: str,
+    request: Request,
+    range: Optional[str] = Header(None, alias="Range"),
+    download: Optional[str] = Query(None),
+    view: Optional[str] = Query(None),
+    format: Optional[str] = Query(None),
+    client: DriveClient = Depends(get_drive_client),
+):
+    """Looks up the most recent file matching filepath in the bucket folder and streams it. Publicly accessible."""
+    ensure_drive_authenticated(client)
+    try:
+        meta = client.get_latest_file_by_name(filepath)
     except FileNotFoundError:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"File '{filename}' not found",
+            detail=f"File '{filepath}' not found",
         )
     except DriveError as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e)
         )
 
-    safe_name = meta["name"].replace('"', '\\"')
-    headers = {
-        "Content-Disposition": f'inline; filename="{safe_name}"',
-    }
-    if meta.get("size") and meta["size"] > 0:
-        headers["Content-Length"] = str(meta["size"])
-
-    media_type = meta.get("mimeType") or "application/octet-stream"
-    return StreamingResponse(
-        client.stream_file(meta["id"]),
-        media_type=media_type,
-        headers=headers,
+    is_download = bool(download and download.lower() in ("1", "true", "yes"))
+    return build_stream_response(
+        meta=meta,
+        client=client,
+        range_header=range,
+        download=is_download,
+        view_mode=view or format,
+        request=request,
     )
 
 
